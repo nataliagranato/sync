@@ -1,0 +1,45 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile authenticated with Google",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth user UID" },
+        "email": { "type": "string", "description": "User email address" },
+        "displayName": { "type": "string", "description": "User display name" },
+        "photoURL": { "type": "string", "description": "User profile image URL" },
+        "createdAt": { "type": "string", "description": "ISO timestamp of account creation" },
+        "updatedAt": { "type": "string", "description": "ISO timestamp of last update" }
+      },
+      "required": ["uid", "email"]
+    },
+    "BackupRecord": {
+      "title": "BackupRecord",
+      "description": "Audit record of a file backup or synchronization job",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique record identifier" },
+        "userId": { "type": "string", "description": "UID of owner user" },
+        "name": { "type": "string", "description": "Filename" },
+        "size": { "type": "number", "description": "File size in bytes" },
+        "sha256Hash": { "type": "string", "description": "File SHA-256 integrity hash" },
+        "encrypted": { "type": "boolean", "description": "Whether the file was encrypted client-side" },
+        "destinations": { "type": "string", "description": "Target cloud destination" },
+        "status": { "type": "string", "description": "Status of sync: completed, failed, pending" },
+        "timestamp": { "type": "string", "description": "ISO timestamp of sync" }
+      },
+      "required": ["id", "userId", "name", "size", "sha256Hash", "status", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User private profile document matching request.auth.uid"
+    },
+    "/users/{userId}/backups/{backupId}": {
+      "schema": "BackupRecord",
+      "description": "User encrypted backup logs and synchronized file history"
+    }
+  }
+}
