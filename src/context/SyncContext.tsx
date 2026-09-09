@@ -1,12 +1,24 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import { doc, setDoc } from 'firebase/firestore';
-import { auth, db, signInWithGoogleReal, signOutFirebase, getCachedGoogleAccessToken } from '../services/firebase';
+import {
+  auth,
+  db,
+  signInWithGoogleReal,
+  signOutFirebase,
+  getCachedGoogleAccessToken,
+  saveBackupRecordToFirestore,
+  fetchUserBackupHistoryFromFirestore,
+  deleteBackupRecordFromFirestore
+} from '../services/firebase';
 import {
   fetchGoogleDriveQuota,
   createGoogleDriveBackupFolder,
   uploadFileToGoogleDrive,
   downloadFileFromGoogleDrive,
+  deleteFileFromGoogleDrive,
+  findFileInGoogleDrive,
+  updateFileInGoogleDrive,
   checkGoogleDriveHealth
 } from '../services/googleDrive';
 import {
@@ -16,6 +28,7 @@ import {
   fetchOneDriveQuota,
   uploadFileToOneDrive,
   downloadFileFromOneDrive,
+  deleteFileFromOneDrive,
   checkOneDriveHealth
 } from '../services/oneDrive';
 import {
@@ -36,7 +49,8 @@ import {
   SyncNotification,
   StorageTarget,
   DeduplicationStats,
-  RestoreProgress
+  RestoreProgress,
+  ConflictDetails
 } from '../types';
 import {
   INITIAL_FILES,
@@ -84,6 +98,9 @@ interface SyncContextType {
   viewerFile: FileItem | null;
   openViewer: (file: FileItem) => void;
   closeViewer: () => void;
+
+  // Conflict Resolution
+  pendingConflict: ConflictDetails | null;
   
   // Actions
   setViewMode: (mode: 'dashboard' | 'iphone_mockup') => void;
@@ -106,7 +123,7 @@ interface SyncContextType {
   addCustomFile: (file: File, category?: IosCategory) => Promise<void>;
   createQuickContact: (name: string, phone: string, email: string, company?: string) => Promise<void>;
   createQuickNote: (title: string, content: string) => Promise<void>;
-  deleteFile: (fileId: string) => void;
+  deleteFile: (fileId: string) => Promise<void>;
   clearAllFiles: () => void;
   loadSampleFiles: () => void;
   resetDefaultData: () => void;
@@ -267,6 +284,9 @@ export const SyncProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setViewerFile(null);
   }, []);
 
+  // Conflict state when a file with identical name already exists
+  const [pendingConflict, setPendingConflict] = useState<ConflictDetails | null>(null);
+
   // Persistence effects
   useEffect(() => {
     try {
@@ -379,6 +399,33 @@ export const SyncProvider: React.FC<{ children: React.ReactNode }> = ({ children
         } catch (e) {
           console.warn('Firestore sync user warning:', e);
         }
+
+        // Fetch user backup history from Firestore
+        fetchUserBackupHistoryFromFirestore(firebaseUser.uid)
+          .then(records => {
+            if (records && records.length > 0) {
+              setHistory(prev => {
+                const existingIds = new Set(prev.map(p => p.id));
+                const mapped: HistoryRecord[] = records
+                  .filter(r => !existingIds.has(r.id))
+                  .map(r => ({
+                    id: r.id,
+                    timestamp: 'Salvo na Nuvem: ' + new Date(r.timestamp).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+                    filesCount: 1,
+                    breakdown: { photos: 0, videos: 0, contacts: 0, documents: 1 },
+                    totalOriginalBytes: r.size,
+                    totalEncryptedBytes: r.size,
+                    providers: [r.destinations as any],
+                    durationSeconds: 1,
+                    status: r.status as any,
+                    batchHash: r.sha256Hash,
+                    details: `Backup registrado: ${r.name}`
+                  }));
+                return [...mapped, ...prev];
+              });
+            }
+          })
+          .catch(err => console.warn('Could not load backup history:', err));
       }
     });
 
@@ -1087,24 +1134,92 @@ export const SyncProvider: React.FC<{ children: React.ReactNode }> = ({ children
       let driveWebViewLink: string | undefined;
       let oneDriveFileId: string | undefined;
       let oneDriveWebUrl: string | undefined;
+      let driveUploadSkipped = false;
 
       const googleToken = getCachedGoogleAccessToken() || storageProviders.find(p => p.id === 'google_drive')?.accessToken;
-      if (job.target === 'google_drive' && googleToken) {
+      if (job.target === 'google_drive') {
+        if (!googleToken) {
+          setUploadQueue(prev => prev.map(j => j.id === job.id ? { ...j, stage: 'error', error: 'Google Drive não conectado' } : j));
+          setFiles(prev => prev.map(f => f.id === targetFile.id ? { ...f, status: 'failed' } : f));
+          addNotification({
+            type: 'error',
+            title: 'Google Drive Não Conectado',
+            message: `Não foi possível enviar "${exactFileName}". Conecte sua conta do Google Drive nas configurações.`
+          });
+          continue;
+        }
+
         try {
           const gProvider = storageProviders.find(p => p.id === 'google_drive');
           const folderName = gProvider?.syncFolder || 'Sync_iOS';
           const folderId = await createGoogleDriveBackupFolder(googleToken, folderName);
-          const upResult = await uploadFileToGoogleDrive(
-            googleToken,
-            exactFileName,
-            uploadBlob,
-            folderId,
-            fileMimeType
-          );
-          driveFileId = upResult.fileId;
-          driveWebViewLink = upResult.webViewLink;
-        } catch (uploadErr) {
-          console.warn('Google Drive direct upload notice:', uploadErr);
+
+          // Check if file with this exact name already exists in Google Drive
+          const existingDriveFile = await findFileInGoogleDrive(googleToken, exactFileName, folderId);
+
+          if (existingDriveFile) {
+            // Prompt user whether to replace or skip
+            const userDecision = await new Promise<'replace' | 'skip'>((resolve) => {
+              setPendingConflict({
+                fileName: exactFileName,
+                fileSize: fileSizeBytes,
+                existingSize: existingDriveFile.size,
+                existingModifiedTime: existingDriveFile.modifiedTime,
+                targetFolder: folderName,
+                onReplace: () => {
+                  setPendingConflict(null);
+                  resolve('replace');
+                },
+                onSkip: () => {
+                  setPendingConflict(null);
+                  resolve('skip');
+                }
+              });
+            });
+
+            if (userDecision === 'skip') {
+              driveUploadSkipped = true;
+              driveFileId = existingDriveFile.id;
+              driveWebViewLink = existingDriveFile.webViewLink;
+              addNotification({
+                type: 'info',
+                title: 'Envio Ignorado',
+                message: `O arquivo existente "${exactFileName}" foi mantido no Google Drive sem alterações.`
+              });
+            } else {
+              // Replace existing file in Google Drive
+              const upResult = await updateFileInGoogleDrive(
+                googleToken,
+                existingDriveFile.id,
+                exactFileName,
+                uploadBlob,
+                fileMimeType
+              );
+              driveFileId = upResult.fileId;
+              driveWebViewLink = upResult.webViewLink;
+            }
+          } else {
+            // Fresh upload
+            const upResult = await uploadFileToGoogleDrive(
+              googleToken,
+              exactFileName,
+              uploadBlob,
+              folderId,
+              fileMimeType
+            );
+            driveFileId = upResult.fileId;
+            driveWebViewLink = upResult.webViewLink;
+          }
+        } catch (uploadErr: any) {
+          console.error('Google Drive sync error:', uploadErr);
+          setUploadQueue(prev => prev.map(j => j.id === job.id ? { ...j, stage: 'error', error: uploadErr?.message || 'Falha ao sincronizar' } : j));
+          setFiles(prev => prev.map(f => f.id === targetFile.id ? { ...f, status: 'failed' } : f));
+          addNotification({
+            type: 'error',
+            title: 'Erro no Google Drive',
+            message: `Falha ao sincronizar "${exactFileName}": ${uploadErr?.message || 'Erro de comunicação'}`
+          });
+          continue;
         }
       }
 
@@ -1190,6 +1305,21 @@ export const SyncProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
         return f;
       }));
+
+      // Persist backup record to Firestore if user is authenticated
+      if (auth.currentUser?.uid) {
+        saveBackupRecordToFirestore(auth.currentUser.uid, {
+          id: 'rec_' + targetFile.id + '_' + Date.now(),
+          userId: auth.currentUser.uid,
+          name: targetFile.name,
+          size: fileSizeBytes,
+          sha256Hash: fileChecksum,
+          encrypted: true,
+          destinations: job.target,
+          status: 'completed',
+          timestamp: new Date().toISOString()
+        }).catch(err => console.warn('Firestore backup record save warning:', err));
+      }
 
       // Refresh Google Drive quota if token is active
       if (googleToken && job.target === 'google_drive') {
@@ -1298,6 +1428,40 @@ export const SyncProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const arrayBuf = await file.arrayBuffer();
     const initialChecksum = await sha256Hex(arrayBuf);
+
+    // Check if a file with identical name already exists in inventory
+    const existingFile = files.find(f => f.name === file.name);
+    if (existingFile) {
+      const decision = await new Promise<'replace' | 'skip'>((resolve) => {
+        setPendingConflict({
+          fileName: file.name,
+          fileSize: file.size,
+          existingSize: existingFile.originalSize,
+          onReplace: () => {
+            setPendingConflict(null);
+            resolve('replace');
+          },
+          onSkip: () => {
+            setPendingConflict(null);
+            resolve('skip');
+          }
+        });
+      });
+
+      if (decision === 'skip') {
+        addNotification({
+          type: 'info',
+          title: 'Adição Cancelada',
+          message: `O arquivo existente "${file.name}" foi mantido no inventário.`
+        });
+        return;
+      } else {
+        // Remove old file record and payload to replace with new version
+        await deleteVaultPayload(existingFile.id);
+        setFiles(prev => prev.filter(f => f.id !== existingFile.id));
+      }
+    }
+
     const fileId = 'usr_file_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
 
     // Save to durable IndexedDB storage
@@ -1333,7 +1497,7 @@ export const SyncProvider: React.FC<{ children: React.ReactNode }> = ({ children
       title: 'Arquivo Adicionado',
       message: `${file.name} (${formatBytes(file.size)}) pronto para proteção AES-GCM.`
     });
-  }, [addNotification]);
+  }, [files, addNotification]);
 
   // Quick contact creator with real vCard RFC 6350 Blob
   const createQuickContact = useCallback(async (name: string, phone: string, email: string, company?: string) => {
@@ -1424,11 +1588,88 @@ export const SyncProvider: React.FC<{ children: React.ReactNode }> = ({ children
     });
   }, [addNotification]);
 
-  const deleteFile = useCallback((fileId: string) => {
-    deleteVaultPayload(fileId).catch(console.warn);
+  const deleteFile = useCallback(async (fileId: string) => {
+    const fileToDelete = files.find(f => f.id === fileId);
+    if (!fileToDelete) return;
+
+    // Immediately remove from UI list & active queue
     setFiles(prev => prev.filter(f => f.id !== fileId));
     setUploadQueue(prev => prev.filter(j => j.fileId !== fileId));
-  }, []);
+    deleteVaultPayload(fileId).catch(console.warn);
+
+    let deletedFromDrive = false;
+    let deletedFromOneDrive = false;
+    let driveErrorMsg: string | null = null;
+
+    // 1. Remove from Google Drive if authenticated
+    const googleToken = getCachedGoogleAccessToken() || storageProviders.find(p => p.id === 'google_drive')?.accessToken;
+    if (googleToken) {
+      try {
+        let driveFileIdToDelete = fileToDelete.driveFileId;
+
+        // If fileId wasn't stored in local object, lookup in Google Drive folder by exact name
+        if (!driveFileIdToDelete) {
+          const gProvider = storageProviders.find(p => p.id === 'google_drive');
+          const folderName = gProvider?.syncFolder || 'Sync_iOS';
+          const folderId = await createGoogleDriveBackupFolder(googleToken, folderName).catch(() => undefined);
+          const found = await findFileInGoogleDrive(googleToken, fileToDelete.name, folderId);
+          if (found?.id) {
+            driveFileIdToDelete = found.id;
+          }
+        }
+
+        if (driveFileIdToDelete) {
+          await deleteFileFromGoogleDrive(googleToken, driveFileIdToDelete);
+          deletedFromDrive = true;
+        }
+      } catch (driveErr: any) {
+        console.warn('Erro ao excluir arquivo do Google Drive:', driveErr);
+        driveErrorMsg = driveErr?.message || 'Erro ao remover do Google Drive';
+      }
+    }
+
+    // 2. Remove from OneDrive if stored
+    const oneDriveToken = storageProviders.find(p => p.id === 'onedrive')?.accessToken;
+    if (oneDriveToken && fileToDelete.oneDriveFileId) {
+      try {
+        await deleteFileFromOneDrive(oneDriveToken, fileToDelete.oneDriveFileId);
+        deletedFromOneDrive = true;
+      } catch (odErr) {
+        console.warn('Erro ao excluir arquivo do OneDrive:', odErr);
+      }
+    }
+
+    // 3. Remove backup log from Firestore if authenticated
+    if (auth.currentUser?.uid) {
+      deleteBackupRecordFromFirestore(auth.currentUser.uid, fileToDelete.id).catch(console.warn);
+      deleteBackupRecordFromFirestore(auth.currentUser.uid, 'rec_' + fileToDelete.id).catch(console.warn);
+    }
+
+    if (deletedFromDrive || deletedFromOneDrive) {
+      const locations = [
+        deletedFromDrive ? 'Google Drive' : '',
+        deletedFromOneDrive ? 'OneDrive' : ''
+      ].filter(Boolean).join(' e ');
+
+      addNotification({
+        type: 'info',
+        title: 'Arquivo Excluído da Nuvem',
+        message: `"${fileToDelete.name}" foi removido do cofre local e excluído do ${locations}.`
+      });
+    } else if (driveErrorMsg) {
+      addNotification({
+        type: 'warning',
+        title: 'Aviso de Exclusão',
+        message: `"${fileToDelete.name}" foi removido localmente, mas não foi possível remover do Drive: ${driveErrorMsg}`
+      });
+    } else {
+      addNotification({
+        type: 'info',
+        title: 'Arquivo Removido',
+        message: `"${fileToDelete.name}" removido do inventário local.`
+      });
+    }
+  }, [files, storageProviders, addNotification]);
 
   const clearAllFiles = useCallback(() => {
     clearVaultStorage().catch(console.warn);
@@ -1607,6 +1848,7 @@ export const SyncProvider: React.FC<{ children: React.ReactNode }> = ({ children
         viewerFile,
         openViewer,
         closeViewer,
+        pendingConflict,
         setViewMode,
         setTheme,
         setMasterPassphrase,

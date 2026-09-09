@@ -1,23 +1,66 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Helper function to check if user is authenticated
-    function isAuthenticated() {
+
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Primitive Helpers
+    function isSignedIn() {
       return request.auth != null && request.auth.uid != null;
     }
 
-    // Helper function to check document ownership
     function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
+      return isSignedIn() && request.auth.uid == userId;
     }
 
-    // Users collection
-    match /users/{userId} {
-      allow read, write: if isOwner(userId);
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
 
-      // Backups subcollection
+    // Validation helper for User profile
+    function isValidUser(data, userId) {
+      return data.uid == userId &&
+        data.email is string && data.email.size() <= 256 &&
+        (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 128)) &&
+        (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 2048)) &&
+        (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+        (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
+    }
+
+    // Validation helper for Backup audit records
+    function isValidBackupRecord(data, userId) {
+      return data.userId == userId &&
+        data.id is string && data.id.size() > 0 && data.id.size() <= 128 &&
+        data.name is string && data.name.size() > 0 && data.name.size() <= 256 &&
+        data.size is number && data.size >= 0 &&
+        data.sha256Hash is string && data.sha256Hash.size() <= 128 &&
+        data.status is string && data.status.size() <= 32 &&
+        data.timestamp is string && data.timestamp.size() <= 64 &&
+        (!('encrypted' in data) || data.encrypted is bool) &&
+        (!('destinations' in data) || (data.destinations is string && data.destinations.size() <= 64));
+    }
+
+    // Connection test document
+    match /test/{testId} {
+      allow get: if true;
+    }
+
+    // Users Collection & Subcollections
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidId(userId) && isValidUser(request.resource.data, userId);
+      allow update: if isOwner(userId) && isValidId(userId) && isValidUser(request.resource.data, userId);
+      allow delete: if isOwner(userId) && isValidId(userId);
+
+      // Backups and Sync History Subcollection
       match /backups/{backupId} {
-        allow read, write: if isOwner(userId);
+        allow get, list: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(backupId) && isValidBackupRecord(request.resource.data, userId);
+        allow update: if isOwner(userId) && isValidId(backupId) && isValidBackupRecord(request.resource.data, userId);
+        allow delete: if isOwner(userId) && isValidId(backupId);
       }
     }
   }

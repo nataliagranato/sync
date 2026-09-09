@@ -151,3 +151,13 @@ export interface SyncNotification {
   provider?: 'google_drive' | 'onedrive';
   read: boolean;
 }
+
+export interface ConflictDetails {
+  fileName: string;
+  fileSize: number;
+  existingSize?: number;
+  existingModifiedTime?: string;
+  targetFolder?: string;
+  onReplace: () => void;
+  onSkip: () => void;
+}

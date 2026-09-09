@@ -15,6 +15,7 @@ import { NotificationToast } from './components/NotificationToast';
 import { IPhoneMockup } from './components/IPhoneMockup';
 import { ZeroKnowledgeMediaViewer } from './components/ZeroKnowledgeMediaViewer';
 import { RestoreModal } from './components/RestoreModal';
+import { ConflictModal } from './components/ConflictModal';
 import {
   ShieldCheck,
   Command,
@@ -36,6 +37,7 @@ function SyncMainApp() {
     viewerFile,
     closeViewer,
     openViewer,
+    pendingConflict,
     files
   } = useSync();
 
@@ -149,6 +151,9 @@ function SyncMainApp() {
         file={viewerFile}
         onClose={closeViewer}
       />
+
+      {/* Cloud Duplicate / Overwrite Conflict Resolution Modal */}
+      <ConflictModal conflict={pendingConflict} />
 
       {/* Command Palette (⌘K) */}
       {commandPaletteOpen && (

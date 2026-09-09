@@ -169,6 +169,130 @@ export async function deleteFileFromGoogleDrive(accessToken: string, fileId: str
   }
 }
 
+export interface DriveExistingFile {
+  id: string;
+  name: string;
+  size?: number;
+  modifiedTime?: string;
+  webViewLink?: string;
+}
+
+/**
+ * Searches for a non-trashed file with exact name inside a specific folder or across drive
+ */
+export async function findFileInGoogleDrive(
+  accessToken: string,
+  fileName: string,
+  folderId?: string
+): Promise<DriveExistingFile | null> {
+  try {
+    const escapedName = fileName.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    let query = `name = '${escapedName}' and trashed = false`;
+    if (folderId) {
+      query += ` and '${folderId}' in parents`;
+    }
+
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(query)}&fields=files(id,name,size,modifiedTime,webViewLink)`,
+      {
+        headers: {
+          Authorization: `Bearer ${accessToken}`
+        }
+      }
+    );
+
+    if (!res.ok) {
+      console.warn('Google Drive find file warning:', res.status);
+      return null;
+    }
+
+    const data = await res.json();
+    if (data.files && data.files.length > 0) {
+      const f = data.files[0];
+      return {
+        id: f.id,
+        name: f.name,
+        size: f.size ? parseInt(f.size, 10) : undefined,
+        modifiedTime: f.modifiedTime,
+        webViewLink: f.webViewLink
+      };
+    }
+    return null;
+  } catch (err) {
+    console.warn('Google Drive search failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Replaces / updates the binary contents of an existing file on Google Drive
+ */
+export async function updateFileInGoogleDrive(
+  accessToken: string,
+  fileId: string,
+  fileName: string,
+  fileBlob: Blob,
+  mimeType?: string
+): Promise<{ fileId: string; webViewLink?: string }> {
+  const actualMimeType = mimeType || fileBlob.type || 'application/octet-stream';
+  const boundary = '-------314159265358979323846';
+  const delimiter = `\r\n--${boundary}\r\n`;
+  const closeDelimiter = `\r\n--${boundary}--`;
+
+  const metaBlob = new Blob([
+    `${delimiter}Content-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({ name: fileName })}\r\n${delimiter}Content-Type: ${actualMimeType}\r\n\r\n`
+  ]);
+  const endBlob = new Blob([closeDelimiter]);
+
+  const multipartBody = new Blob([metaBlob, fileBlob, endBlob], {
+    type: `multipart/related; boundary=${boundary}`
+  });
+
+  const res = await fetch(
+    `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=multipart&fields=id,name,webViewLink`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${accessToken}`
+      },
+      body: multipartBody
+    }
+  );
+
+  if (!res.ok) {
+    // If multipart PATCH fails, try simple media upload
+    const mediaRes = await fetch(
+      `https://www.googleapis.com/upload/drive/v3/files/${encodeURIComponent(fileId)}?uploadType=media`,
+      {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': actualMimeType
+        },
+        body: fileBlob
+      }
+    );
+
+    if (!mediaRes.ok) {
+      const err = await mediaRes.text();
+      console.error('Google Drive update error:', err);
+      throw new Error('Falha ao atualizar arquivo existente no Google Drive');
+    }
+
+    const mediaData = await mediaRes.json();
+    return {
+      fileId: mediaData.id || fileId,
+      webViewLink: mediaData.webViewLink
+    };
+  }
+
+  const data = await res.json();
+  return {
+    fileId: data.id,
+    webViewLink: data.webViewLink
+  };
+}
+
 export async function checkGoogleDriveHealth(accessToken: string): Promise<{ ok: boolean; latencyMs: number; quota: GoogleDriveQuota }> {
   const t0 = performance.now();
   const quota = await fetchGoogleDriveQuota(accessToken);

@@ -7,7 +7,18 @@ import {
   onAuthStateChanged,
   type User as FirebaseUser
 } from 'firebase/auth';
-import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
+import {
+  getFirestore,
+  doc,
+  getDocFromServer,
+  setDoc,
+  deleteDoc,
+  collection,
+  getDocs,
+  query,
+  orderBy,
+  limit
+} from 'firebase/firestore';
 import firebaseConfigJson from '../../firebase-applet-config.json';
 
 const firebaseConfig = {
@@ -22,7 +33,55 @@ const firebaseConfig = {
 // Initialize Firebase once
 export const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 export const auth = getAuth(app);
-export const db = getFirestore(app);
+export const db = getFirestore(app, firebaseConfigJson.firestoreDatabaseId);
+
+// Standardized Firestore Error Handling
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData?.map(provider => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || []
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
 
 // Google Auth Provider setup with Drive scope
 export const googleProvider = new GoogleAuthProvider();
@@ -37,13 +96,13 @@ let cachedGoogleAccessToken: string | null = null;
 export function getCachedGoogleAccessToken(): string | null {
   if (cachedGoogleAccessToken) return cachedGoogleAccessToken;
   try {
-    const saved = sessionStorage.getItem('google_drive_access_token');
+    const saved = sessionStorage.getItem('google_drive_access_token') || localStorage.getItem('google_drive_access_token');
     if (saved) {
       cachedGoogleAccessToken = saved;
       return saved;
     }
   } catch {
-    // Session storage fallback
+    // Storage fallback
   }
   return null;
 }
@@ -53,11 +112,13 @@ export function setCachedGoogleAccessToken(token: string | null): void {
   try {
     if (token) {
       sessionStorage.setItem('google_drive_access_token', token);
+      localStorage.setItem('google_drive_access_token', token);
     } else {
       sessionStorage.removeItem('google_drive_access_token');
+      localStorage.removeItem('google_drive_access_token');
     }
   } catch {
-    // Session storage fallback
+    // Storage fallback
   }
 }
 
@@ -104,3 +165,48 @@ export async function testFirestoreConnection(): Promise<void> {
 
 // Run connection test silently in background
 testFirestoreConnection().catch(() => {});
+
+export interface FirestoreBackupRecord {
+  id: string;
+  userId: string;
+  name: string;
+  size: number;
+  sha256Hash: string;
+  encrypted: boolean;
+  destinations: string;
+  status: string;
+  timestamp: string;
+}
+
+export async function saveBackupRecordToFirestore(userId: string, record: FirestoreBackupRecord): Promise<void> {
+  const path = `users/${userId}/backups/${record.id}`;
+  try {
+    const docRef = doc(db, 'users', userId, 'backups', record.id);
+    await setDoc(docRef, record, { merge: true });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, path);
+  }
+}
+
+export async function fetchUserBackupHistoryFromFirestore(userId: string): Promise<FirestoreBackupRecord[]> {
+  const path = `users/${userId}/backups`;
+  try {
+    const collRef = collection(db, 'users', userId, 'backups');
+    const q = query(collRef, orderBy('timestamp', 'desc'), limit(50));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(d => d.data() as FirestoreBackupRecord);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.LIST, path);
+    return [];
+  }
+}
+
+export async function deleteBackupRecordFromFirestore(userId: string, recordId: string): Promise<void> {
+  const path = `users/${userId}/backups/${recordId}`;
+  try {
+    const docRef = doc(db, 'users', userId, 'backups', recordId);
+    await deleteDoc(docRef);
+  } catch (error) {
+    console.warn('Could not delete backup record from Firestore:', error);
+  }
+}
